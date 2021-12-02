@@ -77,26 +77,34 @@ public actor Transceiver<MessageT: EAPMessage & Equatable> {
         await session.output.setWriteDataStream(writeDataStream)
         return Task {
             for try await data in read {
-                let messages = MessageT.destructure(data: data)
-                for message in messages {
-                    // match or drop
-                    let matchingRequestIndices = outstandingRequests.indices.filter({
-                        outstandingRequests[$0].request.isMatched(response: message)
-                    })
-                    if let outstandingRequestIndex = matchingRequestIndices.first {
-                        let outstandingRequest = outstandingRequests[outstandingRequestIndex]
-                        outstandingRequest.timer.cancel()
-                        outstandingRequest.continuation.resume(returning: message)
-                        outstandingRequests.remove(at: outstandingRequestIndex)
-                    } else {
-                        if await factory.isPush(message) {
-                            delegate?.received(push: message)
-                        }
-                    }
-                }
+                await process(data: data, delegate: delegate)
             }
             finish?()
             write = nil
+        }
+    }
+#if DEBUG
+    public func inject(_ response: MessageT, delegate: TransceiverDelegate) async {
+        await process(data: response.data, delegate: delegate)
+    }
+#endif
+    func process(data: Data, delegate: TransceiverDelegate?) async {
+        let messages = MessageT.destructure(data: data)
+        for message in messages {
+            // match or drop
+            let matchingRequestIndices = outstandingRequests.indices.filter({
+                outstandingRequests[$0].request.isMatched(response: message)
+            })
+            if let outstandingRequestIndex = matchingRequestIndices.first {
+                let outstandingRequest = outstandingRequests[outstandingRequestIndex]
+                outstandingRequest.timer.cancel()
+                outstandingRequest.continuation.resume(returning: message)
+                outstandingRequests.remove(at: outstandingRequestIndex)
+            } else {
+                if await factory.isPush(message) {
+                    delegate?.received(push: message)
+                }
+            }
         }
     }
     public func send(_ request: MessageT, requestTimeoutSeconds: UInt = 2) async -> Result<MessageT, AccessoryAccessError> {

@@ -28,7 +28,12 @@ actor ConcreteEAPMessageFactory: EAPMessageFactory {
     func isPush(_ message: EAPMessage) async -> Bool {
         let messageTxSequenceNumber = message.data[0]
         let messageRxSequenceNumber = message.data[1]
-        return messageTxSequenceNumber == 0 && (rxSequenceNumber == nil || rxSequenceNumber == messageRxSequenceNumber)
+        let isPush = messageTxSequenceNumber == 0 && (rxSequenceNumber == nil || rxSequenceNumber == messageRxSequenceNumber)
+        if isPush {
+            let nextSequenceNumber = messageRxSequenceNumber &+ 1
+            rxSequenceNumber = nextSequenceNumber
+        }
+        return isPush
     }
 }
 
@@ -174,19 +179,48 @@ final class EAPFramingTests: XCTestCase {
     func testPush() async {
         let _ = await transceiver.listen(with: self)
         let size = 16
-        let requestData = Data.init(count: size)
-        guard let requestMessage = await messageFactory.message(from: requestData) as? ConcreteEAPMessage else {
-            XCTFail()
-            return
-        }
         var pushData = Data.init(count: size)
         pushData[1] = 0x55 // set RxSN
-        let pushMessage = ConcreteEAPMessage.init(from: pushData)
-        let response = await transceiver.send(requestMessage, requestTimeoutSeconds: 1, requestOverride: pushMessage)
-        guard case .failure(let error) = response, error == .requestTimeout else {
+        guard let pushMessage = ConcreteEAPMessage.init(from: pushData) else {
             XCTFail()
             return
         }
+        await transceiver.inject(pushMessage, delegate: self)
+        XCTAssert(pushCount == 1)
+        pushCount = 0
+    }
+    
+    func testDoublePush() async {
+        let _ = await transceiver.listen(with: self)
+        let size = 16
+        var pushData = Data.init(count: size)
+        pushData[1] = 0x55 // set RxSN
+        guard let firstPushMessage = ConcreteEAPMessage.init(from: pushData) else {
+            XCTFail()
+            return
+        }
+        pushData[1] = 0x56 // set RxSN
+        guard let secondPushMessage = ConcreteEAPMessage.init(from: pushData) else {
+            XCTFail()
+            return
+        }
+        await transceiver.inject(firstPushMessage, delegate: self)
+        await transceiver.inject(secondPushMessage, delegate: self)
+        XCTAssert(pushCount == 2)
+        pushCount = 0
+    }
+    
+    func testDuplicatePush() async {
+        let _ = await transceiver.listen(with: self)
+        let size = 16
+        var pushData = Data.init(count: size)
+        pushData[1] = 0x55 // set RxSN
+        guard let pushMessage = ConcreteEAPMessage.init(from: pushData) else {
+            XCTFail()
+            return
+        }
+        await transceiver.inject(pushMessage, delegate: self)
+        await transceiver.inject(pushMessage, delegate: self)
         XCTAssert(pushCount == 1)
         pushCount = 0
     }
