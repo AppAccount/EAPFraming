@@ -20,12 +20,12 @@ public typealias SequenceNumber = UInt8
 actor ConcreteEAPMessageFactory: EAPMessageFactory {
     var txSequenceNumber = SequenceNumber(arc4random_uniform(1<<8)) // reduce the likelihood of false accepts on replay after app restart
     var rxSequenceNumber: SequenceNumber?
-    func message(from: Data) async -> EAPMessage? {
+    func message<MessageT: EAPMessage>(with payload: Data) async throws -> MessageT {
         let header = Data.init([txSequenceNumber, 0])
         txSequenceNumber &+= 1 // "&+" is Swift's overflow addition operator
-        return ConcreteEAPMessage.init(from: header + from)
+        return try MessageT.init(from: header + payload)
     }
-    func isPush(_ message: EAPMessage) async -> Bool {
+    func isPush<MessageT: EAPMessage>(_ message: MessageT) async -> Bool {
         let messageTxSequenceNumber = message.data[0]
         let messageRxSequenceNumber = message.data[1]
         let isPush = messageTxSequenceNumber == 0 && (rxSequenceNumber == nil || rxSequenceNumber == messageRxSequenceNumber)
@@ -39,7 +39,7 @@ actor ConcreteEAPMessageFactory: EAPMessageFactory {
 
 struct ConcreteEAPMessage: EAPMessage, Equatable {
     static func destructure(data: Data) -> [ConcreteEAPMessage] {
-        if let envelope = Self.init(from: data) {
+        if let envelope = try? Self.init(from: data) {
             return [envelope]
         }
         return []
@@ -47,7 +47,7 @@ struct ConcreteEAPMessage: EAPMessage, Equatable {
     
     var data: Data
 
-    init?(from data: Data) {
+    init(from data: Data) throws {
         self.data = data
     }
     
@@ -129,10 +129,7 @@ final class EAPFramingTests: XCTestCase {
         }
         input.delegate?.stream?(input, handle: Stream.Event.endEncountered)
         try await listener.value
-        guard let requestMessage = ConcreteEAPMessage(from: Data.init(count: 16)) else {
-            XCTFail()
-            return
-        }
+        let requestMessage = try ConcreteEAPMessage(from: Data.init(count: 16))
         let response = await transceiver.send(requestMessage)
         guard case .failure(let accessError) = response, accessError == .disconnected else {
             XCTFail()
@@ -140,14 +137,11 @@ final class EAPFramingTests: XCTestCase {
         }
     }
     
-    func testRequestResponse() async {
+    func testRequestResponse() async throws {
         let _ = await transceiver.listen()
         let size = 16
         let requestData = Data.init(count: size)
-        guard let requestMessage = await messageFactory.message(from: requestData) as? ConcreteEAPMessage else {
-            XCTFail()
-            return
-        }
+        let requestMessage: ConcreteEAPMessage = try await messageFactory.message(with: requestData)
         print("send request")
         let response = await transceiver.send(requestMessage)
         guard case .success(let responseMessage) = response, responseMessage == requestMessage else {
@@ -156,69 +150,51 @@ final class EAPFramingTests: XCTestCase {
         }
     }
     
-    func testRequestResponseTimeout() async {
+    func testRequestResponseTimeout() async throws {
         let _ = await transceiver.listen()
         let size = 16
         let requestData = Data.init(count: size)
-        guard let requestMessage = await messageFactory.message(from: requestData) as? ConcreteEAPMessage else {
-            XCTFail()
-            return
-        }
-        guard let requestOverride = await messageFactory.message(from: requestData) as? ConcreteEAPMessage else {
-            XCTFail()
-            return
-        }
+        let requestMessage: ConcreteEAPMessage = try await messageFactory.message(with: requestData)
+        let requestOverride: ConcreteEAPMessage = try await messageFactory.message(with: requestData)
         print("send request")
-        let response = await transceiver.send(requestMessage, requestTimeoutSeconds: 1, requestOverride: requestOverride)
+        let response = await transceiver.send(requestMessage, requestTimeoutSeconds: nil, requestOverride: requestOverride)
         guard case .failure(let error) = response, error == .requestTimeout else {
             XCTFail()
             return
         }
     }
     
-    func testPush() async {
+    func testPush() async throws {
         let _ = await transceiver.listen(with: self)
         let size = 16
         var pushData = Data.init(count: size)
         pushData[1] = 0x55 // set RxSN
-        guard let pushMessage = ConcreteEAPMessage.init(from: pushData) else {
-            XCTFail()
-            return
-        }
+        let pushMessage = try ConcreteEAPMessage.init(from: pushData)
         await transceiver.inject(pushMessage, delegate: self)
         XCTAssert(pushCount == 1)
         pushCount = 0
     }
     
-    func testDoublePush() async {
+    func testDoublePush() async throws {
         let _ = await transceiver.listen(with: self)
         let size = 16
         var pushData = Data.init(count: size)
         pushData[1] = 0x55 // set RxSN
-        guard let firstPushMessage = ConcreteEAPMessage.init(from: pushData) else {
-            XCTFail()
-            return
-        }
+        let firstPushMessage = try ConcreteEAPMessage.init(from: pushData)
         pushData[1] = 0x56 // set RxSN
-        guard let secondPushMessage = ConcreteEAPMessage.init(from: pushData) else {
-            XCTFail()
-            return
-        }
+        let secondPushMessage = try ConcreteEAPMessage.init(from: pushData)
         await transceiver.inject(firstPushMessage, delegate: self)
         await transceiver.inject(secondPushMessage, delegate: self)
         XCTAssert(pushCount == 2)
         pushCount = 0
     }
     
-    func testDuplicatePush() async {
+    func testDuplicatePush() async throws {
         let _ = await transceiver.listen(with: self)
         let size = 16
         var pushData = Data.init(count: size)
         pushData[1] = 0x55 // set RxSN
-        guard let pushMessage = ConcreteEAPMessage.init(from: pushData) else {
-            XCTFail()
-            return
-        }
+        let pushMessage = try ConcreteEAPMessage.init(from: pushData)
         await transceiver.inject(pushMessage, delegate: self)
         await transceiver.inject(pushMessage, delegate: self)
         XCTAssert(pushCount == 1)
@@ -236,7 +212,7 @@ extension EAPFramingTests: AccessoryConnectionDelegate {
 }
 
 extension EAPFramingTests: TransceiverDelegate {
-    func received(push: EAPMessage) {
+    func received<MessageT: EAPMessage>(push: MessageT) {
         print(#function)
         pushCount += 1
     }

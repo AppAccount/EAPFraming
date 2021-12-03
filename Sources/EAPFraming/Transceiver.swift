@@ -25,13 +25,13 @@ import Foundation
 import AsyncExternalAccessory
 
 public protocol EAPMessageFactory {
-    func message(from: Data) async -> EAPMessage?
-    func isPush(_: EAPMessage) async -> Bool
+    func message<MessageT: EAPMessage>(with: Data) async throws -> MessageT
+    func isPush<MessageT: EAPMessage>(_: MessageT) async -> Bool
 }
 
 public protocol EAPMessage {
     static func destructure(data: Data) -> [Self]
-    init?(from data: Data)
+    init(from data: Data) throws
     var data: Data { get }
     func isMatched(response: EAPMessage) -> Bool
 }
@@ -42,7 +42,7 @@ public enum AccessoryAccessError: Error {
 }
 
 public protocol TransceiverDelegate: AnyObject {
-    func received(push: EAPMessage)
+    func received<MessageT: EAPMessage>(push: MessageT)
 }
 
 public actor Transceiver<MessageT: EAPMessage & Equatable> {
@@ -110,6 +110,11 @@ public actor Transceiver<MessageT: EAPMessage & Equatable> {
     public func send(_ request: MessageT, requestTimeoutSeconds: UInt = 2) async -> Result<MessageT, AccessoryAccessError> {
         await send(request, requestTimeoutSeconds: requestTimeoutSeconds, requestOverride: nil)
     }
+#if DEBUG
+    public func send(_ request: MessageT, requestTimeoutSeconds: UInt?, requestOverride: MessageT?) async -> Result<MessageT, AccessoryAccessError> {
+        await send(request, requestTimeoutSeconds: requestTimeoutSeconds ?? 2, requestOverride: requestOverride)
+    }
+#endif
     func send(_ request: MessageT, requestTimeoutSeconds: UInt, requestOverride: MessageT?) async -> Result<MessageT, AccessoryAccessError> {
         guard let write = write else {
             return .failure(.disconnected)
