@@ -1,0 +1,25 @@
+{
+  "object": {
+    "pins": [
+      {
+        "package": "AsyncExternalAccessory",
+        "repositoryURL": "https://github.com/AppAccount/AsyncExternalAccessory",
+        "state": {
+          "branch": null,
+          "revision": "7f1711da14208caafac2828e4a8eba3e28e14e20",
+          "version": "2.1.1"
+        }
+      },
+      {
+        "package": "AsyncStream",
+        "repositoryURL": "https://github.com/AppAccount/AsyncStream",
+        "state": {
+          "branch": null,
+          "revision": "821c1bc5b949854cbe4250c3580e0bec10b2c165",
+          "version": "2.1.0"
+        }
+      }
+    ]
+  },
+  "version": 1
+}
