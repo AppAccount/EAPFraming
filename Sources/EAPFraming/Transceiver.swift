@@ -25,75 +25,96 @@ import Foundation
 import AsyncExternalAccessory
 
 public protocol EAPMessageFactory {
-    func message<MessageT: EAPMessage>(with: Data) async throws -> MessageT
-    func isPush<MessageT: EAPMessage>(_: MessageT) async -> Bool
+    associatedtype MessageT: EAPMessage
+    func encapsulate(body: MessageT.BodyT) throws -> MessageT
+    func isMatched(_: MessageT, _: MessageT) -> Bool
+    func isPush(_: MessageT) -> Bool
+    func destructure(data: Data) -> [MessageT]
+}
+
+public protocol EAPMessageBody {
+    var data: Data { get }
 }
 
 public protocol EAPMessage {
-    static func destructure(data: Data) -> [Self]
-    init(from data: Data) throws
+    associatedtype BodyT: EAPMessageBody
+    init(data: Data) throws
+    init(body: BodyT)
     var data: Data { get }
-    func isMatched(response: EAPMessage) -> Bool
+    var body: BodyT { get }
 }
 
 public enum AccessoryAccessError: Error {
     case requestTimeout
     case disconnected
+    case invalidRequest
 }
 
-public protocol TransceiverDelegate: AnyObject {
-    func received<MessageT: EAPMessage>(push: MessageT)
-}
-
-public actor Transceiver<MessageT: EAPMessage & Equatable> {
+public actor Transceiver<FactoryT: EAPMessageFactory> {
     struct OutstandingRequest {
-        var request: MessageT
-        var continuation: CheckedContinuation<MessageT, Error>
+        var request: FactoryT.MessageT
+        var continuation: CheckedContinuation<FactoryT.MessageT, Error>
         var timer: Task<(), Never>
     }
     let accessory: AccessoryProtocol
     let session: DuplexAsyncStream
-    let factory: EAPMessageFactory
+    let factory: FactoryT
     var outstandingRequests = [OutstandingRequest]()
     var write: ((Data)->())?
     var finish: (()->())?
     var read: AsyncThrowingStream<Data, Error>?
+    var push: ((FactoryT.MessageT.BodyT)->())?
     
-    public init(accessory: AccessoryProtocol, session: DuplexAsyncStream, factory: EAPMessageFactory) {
+    public init(accessory: AccessoryProtocol, session: DuplexAsyncStream, factory: FactoryT) {
         self.accessory = accessory
         self.session = session
         self.factory = factory
     }
-    public func listen(with delegate: TransceiverDelegate?=nil) async -> Task<(), Error> {
+    public func listen() async -> AsyncStream<FactoryT.MessageT.BodyT> {
         let read = await session.input.getReadDataStream()
+        var writeFinish: (()->())?
         let writeDataStream = AsyncStream<Data> { continuation in
             write = { data in
                 continuation.yield(data)
             }
-            finish = {
+            writeFinish = {
                 continuation.finish()
             }
         }
         await session.output.setWriteDataStream(writeDataStream)
-        return Task {
+        var pushFinish: (()->())?
+        let push = AsyncStream<FactoryT.MessageT.BodyT> { continuation in
+            self.push = { body in
+                continuation.yield(body)
+            }
+            pushFinish = {
+                continuation.finish()
+            }
+        }
+        finish = {
+            writeFinish?()
+            pushFinish?()
+        }
+        Task {
             for try await data in read {
-                await process(data: data, delegate: delegate)
+                await process(data: data)
             }
             finish?()
             write = nil
         }
+        return push
     }
 #if DEBUG
-    public func inject(_ response: MessageT, delegate: TransceiverDelegate) async {
-        await process(data: response.data, delegate: delegate)
+    public func inject(_ response: FactoryT.MessageT) async {
+        await process(data: response.data)
     }
 #endif
-    func process(data: Data, delegate: TransceiverDelegate?) async {
-        let messages = MessageT.destructure(data: data)
+    func process(data: Data) async {
+        let messages: [FactoryT.MessageT] = factory.destructure(data: data)
         for message in messages {
             // match or drop
             let matchingRequestIndices = outstandingRequests.indices.filter({
-                outstandingRequests[$0].request.isMatched(response: message)
+                factory.isMatched(outstandingRequests[$0].request, message)
             })
             if let outstandingRequestIndex = matchingRequestIndices.first {
                 let outstandingRequest = outstandingRequests[outstandingRequestIndex]
@@ -101,27 +122,31 @@ public actor Transceiver<MessageT: EAPMessage & Equatable> {
                 outstandingRequest.continuation.resume(returning: message)
                 outstandingRequests.remove(at: outstandingRequestIndex)
             } else {
-                if await factory.isPush(message) {
-                    delegate?.received(push: message)
+                if factory.isPush(message) {
+                    push?(message.body)
                 }
             }
         }
     }
-    public func send(_ request: MessageT, requestTimeoutSeconds: UInt = 2) async -> Result<MessageT, AccessoryAccessError> {
-        await send(request, requestTimeoutSeconds: requestTimeoutSeconds, requestOverride: nil)
+    public func send(_ request: FactoryT.MessageT.BodyT, requestTimeoutSeconds: UInt = 2) async -> Result<FactoryT.MessageT.BodyT, AccessoryAccessError> {
+        guard let requestMessage: FactoryT.MessageT = try? factory.encapsulate(body: request) else {
+            return .failure(.invalidRequest)
+        }
+        return await send(requestMessage, requestTimeoutSeconds: requestTimeoutSeconds, requestOverride: nil)
     }
 #if DEBUG
-    public func send(_ request: MessageT, requestTimeoutSeconds: UInt?, requestOverride: MessageT?) async -> Result<MessageT, AccessoryAccessError> {
+    /// bypass factory for testability
+    public func send(_ request: FactoryT.MessageT, requestTimeoutSeconds: UInt?, requestOverride: FactoryT.MessageT?) async -> Result<FactoryT.MessageT.BodyT, AccessoryAccessError> {
         await send(request, requestTimeoutSeconds: requestTimeoutSeconds ?? 2, requestOverride: requestOverride)
     }
 #endif
-    func send(_ request: MessageT, requestTimeoutSeconds: UInt, requestOverride: MessageT?) async -> Result<MessageT, AccessoryAccessError> {
+    func send(_ request: FactoryT.MessageT, requestTimeoutSeconds: UInt, requestOverride: FactoryT.MessageT?) async -> Result<FactoryT.MessageT.BodyT, AccessoryAccessError> {
         guard let write = write else {
             return .failure(.disconnected)
         }
         write(requestOverride?.data ?? request.data)
         do {
-            let response: MessageT = try await withCheckedThrowingContinuation { cont in
+            let response: FactoryT.MessageT = try await withCheckedThrowingContinuation { cont in
                 let timer = Task {
                     do {
                         try await Task.sleep(nanoseconds: UInt64(requestTimeoutSeconds)*1_000_000_000)
@@ -132,7 +157,7 @@ public actor Transceiver<MessageT: EAPMessage & Equatable> {
                         return
                     }
                     if let outstandingRequestIndex = outstandingRequests.indices.filter({
-                        outstandingRequests[$0].request == request
+                        factory.isMatched(outstandingRequests[$0].request, request)
                     }).first {
                         cont.resume(throwing: AccessoryAccessError.requestTimeout)
                         outstandingRequests.remove(at: outstandingRequestIndex)
@@ -141,7 +166,7 @@ public actor Transceiver<MessageT: EAPMessage & Equatable> {
                 let outstandingRequest = OutstandingRequest(request: request, continuation: cont, timer: timer)
                 outstandingRequests.append(outstandingRequest)
             }
-            return .success(response)
+            return .success(response.body)
         } catch(let e) {
             return .failure(e as! AccessoryAccessError)
         }

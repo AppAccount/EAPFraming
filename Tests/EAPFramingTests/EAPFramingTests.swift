@@ -17,15 +17,24 @@ func makeMock() throws -> AccessoryMock {
 
 public typealias SequenceNumber = UInt8
 
-actor ConcreteEAPMessageFactory: EAPMessageFactory {
+/// Sample message framing format:
+///  1B client request sequence number
+///  1B accessory notification sequence number
+///  2B frame length (max 4kB including header)
+class ConcreteEAPMessageFactory: EAPMessageFactory {
     var txSequenceNumber = SequenceNumber(arc4random_uniform(1<<8)) // reduce the likelihood of false accepts on replay after app restart
     var rxSequenceNumber: SequenceNumber?
-    func message<MessageT: EAPMessage>(with payload: Data) async throws -> MessageT {
-        let header = Data.init([txSequenceNumber, 0])
+    var remainder: Data?
+    func encapsulate(body: ConcreteEAPMessageBody) throws -> ConcreteEAPMessage {
+        let header = Data.init([txSequenceNumber, 0, 0, UInt8(body.data.count)])
         txSequenceNumber &+= 1 // "&+" is Swift's overflow addition operator
-        return try MessageT.init(from: header + payload)
+        return try ConcreteEAPMessage.init(data: header + body.data)
     }
-    func isPush<MessageT: EAPMessage>(_ message: MessageT) async -> Bool {
+    func isMatched(_ first: ConcreteEAPMessage, _ second: ConcreteEAPMessage) -> Bool {
+        first.data[first.data.startIndex] == second.data[second.data.startIndex] &&
+        first.data[first.data.startIndex + 1] == second.data[second.data.startIndex+1]
+    }
+    func isPush(_ message: ConcreteEAPMessage) -> Bool {
         let messageTxSequenceNumber = message.data[0]
         let messageRxSequenceNumber = message.data[1]
         let isPush = messageTxSequenceNumber == 0 && (rxSequenceNumber == nil || rxSequenceNumber == messageRxSequenceNumber)
@@ -35,37 +44,71 @@ actor ConcreteEAPMessageFactory: EAPMessageFactory {
         }
         return isPush
     }
-}
-
-struct ConcreteEAPMessage: EAPMessage, Equatable {
-    static func destructure(data: Data) -> [ConcreteEAPMessage] {
-        if let envelope = try? Self.init(from: data) {
-            return [envelope]
+    func destructure(data: Data) -> [ConcreteEAPMessage] {
+        print(#function, data.count)
+        var dataAndRemainder: Data
+        if let remainder = remainder {
+            print("with remainder \(remainder.count)")
+            dataAndRemainder = remainder + data
+            self.remainder = nil
+        } else {
+            dataAndRemainder = data
+        }
+        guard dataAndRemainder.count >= ConcreteEAPMessage.headerLength else {
+            remainder = dataAndRemainder
+            return []
+        }
+        let bodyLength = ConcreteEAPMessage.bodyLength(from: dataAndRemainder)
+        let messageLength = ConcreteEAPMessage.headerLength + bodyLength
+        guard dataAndRemainder.count >= messageLength else {
+            remainder = dataAndRemainder
+            return []
+        }
+        let index = dataAndRemainder.startIndex
+        if let envelope = try? ConcreteEAPMessage.init(data: dataAndRemainder[index..<index+messageLength]) {
+            return [envelope] + destructure(data: dataAndRemainder.dropFirst(messageLength))
         }
         return []
     }
-    
-    var data: Data
+}
 
-    init(from data: Data) throws {
-        self.data = data
-    }
+struct ConcreteEAPMessage: EAPMessage {
+    static var headerLength = 4
     
-    func isMatched(response: EAPMessage) -> Bool {
-        data[0] == response.data[0] && data[1] == response.data[1]
+    static func bodyLength(from data: Data) -> Int {
+        Int(data[data.startIndex+3])
     }
+    var header: Data
+    var body: ConcreteEAPMessageBody
+    var data: Data {
+        header + body.data
+    }
+
+    init(data: Data) throws {
+        let bodyLength = Self.bodyLength(from: data)
+        guard data.count == Self.headerLength + bodyLength else { throw "invalid framing" }
+        guard data.count <= 4096 else { throw "frame too long" }
+        self.header = data[data.startIndex..<data.startIndex+Self.headerLength]
+        self.body = ConcreteEAPMessageBody.init(data: data.dropFirst(Self.headerLength))
+    }
+    init(body: ConcreteEAPMessageBody) {
+        self.header = Data.init(count: Self.headerLength)
+        self.body = body
+    }
+}
+
+struct ConcreteEAPMessageBody: EAPMessageBody, Equatable {
+    var data: Data
 }
 
 final class EAPFramingTests: XCTestCase {
     static let testTimeout: UInt64 = 8_000_000_000
     var manager: ExternalAccessoryManager!
     var accessory: AccessoryMock!
-    var transceiver: Transceiver<ConcreteEAPMessage>!
-    var messageFactory: ConcreteEAPMessageFactory!
+    var transceiver: Transceiver<ConcreteEAPMessageFactory>!
     var shouldOpenCompletion: ((AccessoryMock)->Bool)?
     var didOpenCompletion: ((AccessoryMock, DuplexAsyncStream?)->())?
     var timeoutTask: Task<(), Never>!
-    var pushCount: Int!
     
     override func setUp() async throws {
         continueAfterFailure = false
@@ -99,38 +142,35 @@ final class EAPFramingTests: XCTestCase {
             XCTFail()
             return
         }
-        pushCount = 0
-        messageFactory = ConcreteEAPMessageFactory()
-        transceiver = Transceiver<ConcreteEAPMessage>(accessory: accessory, session: duplex, factory: messageFactory)
+        transceiver = Transceiver(accessory: accessory, session: duplex, factory: ConcreteEAPMessageFactory())
     }
     
     override func tearDown() {
-        XCTAssert(pushCount == 0)
         shouldOpenCompletion = nil
         didOpenCompletion = nil
         timeoutTask.cancel()
     }
     
     func testListenerDisconnect() async throws {
-        let listener = await transceiver.listen()
+        let pushStream = await transceiver.listen()
         guard let duplex = self.accessory.getStreams(), let input = duplex.input else {
             XCTFail()
             return
         }
         input.delegate?.stream?(input, handle: Stream.Event.endEncountered)
-        try await listener.value
+        for await _ in pushStream { XCTFail() }
     }
     
     func testDisconnectedRequest() async throws {
-        let listener = await transceiver.listen()
+        let pushStream = await transceiver.listen()
         guard let duplex = self.accessory.getStreams(), let input = duplex.input else {
             XCTFail()
             return
         }
         input.delegate?.stream?(input, handle: Stream.Event.endEncountered)
-        try await listener.value
-        let requestMessage = try ConcreteEAPMessage(from: Data.init(count: 16))
-        let response = await transceiver.send(requestMessage)
+        for await _ in pushStream { XCTFail() }
+        let request = ConcreteEAPMessageBody.init(data: Data.init(count: 16))
+        let response = await transceiver.send(request)
         guard case .failure(let accessError) = response, accessError == .disconnected else {
             XCTFail()
             return
@@ -138,67 +178,132 @@ final class EAPFramingTests: XCTestCase {
     }
     
     func testRequestResponse() async throws {
-        let _ = await transceiver.listen()
-        let size = 16
-        let requestData = Data.init(count: size)
-        let requestMessage: ConcreteEAPMessage = try await messageFactory.message(with: requestData)
-        print("send request")
-        let response = await transceiver.send(requestMessage)
-        guard case .success(let responseMessage) = response, responseMessage == requestMessage else {
+        let pushStream = await transceiver.listen()
+        Task {
+            for await _ in pushStream { XCTFail() }
+        }
+        let size = 252
+        let requestData = Data.init(repeating: UInt8.random(in: 0...255), count: size)
+        let request = ConcreteEAPMessageBody.init(data: requestData)
+        let result = await transceiver.send(request)
+        guard case .success(let reponse) = result, reponse == request else {
             XCTFail()
             return
         }
     }
     
     func testRequestResponseTimeout() async throws {
-        let _ = await transceiver.listen()
+        let pushStream = await transceiver.listen()
+        Task {
+            for await _ in pushStream { XCTFail() }
+        }
+        let factory = ConcreteEAPMessageFactory()
         let size = 16
         let requestData = Data.init(count: size)
-        let requestMessage: ConcreteEAPMessage = try await messageFactory.message(with: requestData)
-        let requestOverride: ConcreteEAPMessage = try await messageFactory.message(with: requestData)
-        print("send request")
-        let response = await transceiver.send(requestMessage, requestTimeoutSeconds: nil, requestOverride: requestOverride)
+        let requestBody = ConcreteEAPMessageBody.init(data: requestData)
+        let request = try factory.encapsulate(body: requestBody)
+        let requestOverride = try factory.encapsulate(body: requestBody)
+        // response will be dropped due to a sequence number mismatch, resulting in a timeout
+        let response = await transceiver.send(request, requestTimeoutSeconds: nil, requestOverride: requestOverride)
         guard case .failure(let error) = response, error == .requestTimeout else {
             XCTFail()
             return
         }
     }
     
+    func testRequestBackPressure() async throws {
+        let _ = await transceiver.listen()
+        let size = 255
+        let count = 32
+        await withTaskGroup(of: Result<ConcreteEAPMessageBody, AccessoryAccessError>.self, body: { taskGroup in
+            for i in 0..<count {
+                taskGroup.addTask {
+                    let requestData = Data.init(repeating: UInt8(i), count: size)
+                    let request = ConcreteEAPMessageBody.init(data: requestData)
+                    print("send \(i)")
+                    let result = await self.transceiver.send(request)
+                    print("result \(result)")
+                    return result
+                }
+            }
+            var results: Array<Result<ConcreteEAPMessageBody, AccessoryAccessError>> = []
+            for await result in taskGroup {
+                guard case .success(let response) = result else {
+                    XCTFail()
+                    return
+                }
+                print("received \(response.data[response.data.startIndex])")
+                results.append(result)
+            }
+            XCTAssert(results.count == count)
+        })
+    }
+    
     func testPush() async throws {
-        let _ = await transceiver.listen(with: self)
+        let pushStream = await transceiver.listen()
         let size = 16
         var pushData = Data.init(count: size)
         pushData[1] = 0x55 // set RxSN
-        let pushMessage = try ConcreteEAPMessage.init(from: pushData)
-        await transceiver.inject(pushMessage, delegate: self)
-        XCTAssert(pushCount == 1)
-        pushCount = 0
+        pushData[3] = UInt8(size - ConcreteEAPMessage.headerLength)
+        let pushMessage = try ConcreteEAPMessage.init(data: pushData)
+        await withTaskGroup(of: Void.self) { taskGroup in
+            taskGroup.addTask {
+                for await _ in pushStream {
+                    return
+                }
+            }
+            taskGroup.addTask {
+                await self.transceiver.inject(pushMessage)
+            }
+            await taskGroup.waitForAll()
+        }
     }
     
     func testDoublePush() async throws {
-        let _ = await transceiver.listen(with: self)
+        let pushStream = await transceiver.listen()
+        let pushCounter: Task<Void, Never> = Task {
+            var count = 0
+            for await _ in pushStream {
+                count += 1
+                if count >= 2 {
+                    return
+                }
+            }
+        }
         let size = 16
         var pushData = Data.init(count: size)
         pushData[1] = 0x55 // set RxSN
-        let firstPushMessage = try ConcreteEAPMessage.init(from: pushData)
+        pushData[3] = UInt8(size - ConcreteEAPMessage.headerLength)
+        let firstPushMessage = try ConcreteEAPMessage.init(data: pushData)
         pushData[1] = 0x56 // set RxSN
-        let secondPushMessage = try ConcreteEAPMessage.init(from: pushData)
-        await transceiver.inject(firstPushMessage, delegate: self)
-        await transceiver.inject(secondPushMessage, delegate: self)
-        XCTAssert(pushCount == 2)
-        pushCount = 0
+        let secondPushMessage = try ConcreteEAPMessage.init(data: pushData)
+        await transceiver.inject(firstPushMessage)
+        await transceiver.inject(secondPushMessage)
+        await pushCounter.value
     }
     
     func testDuplicatePush() async throws {
-        let _ = await transceiver.listen(with: self)
+        let pushStream = await transceiver.listen()
+        let pushCounter: Task<Void, Never> = Task {
+            var count = 0
+            for await _ in pushStream {
+                count += 1
+                if count >= 2 {
+                    return
+                }
+            }
+        }
         let size = 16
         var pushData = Data.init(count: size)
         pushData[1] = 0x55 // set RxSN
-        let pushMessage = try ConcreteEAPMessage.init(from: pushData)
-        await transceiver.inject(pushMessage, delegate: self)
-        await transceiver.inject(pushMessage, delegate: self)
-        XCTAssert(pushCount == 1)
-        pushCount = 0
+        pushData[3] = UInt8(size - ConcreteEAPMessage.headerLength)
+        let pushMessage = try ConcreteEAPMessage.init(data: pushData)
+        await transceiver.inject(pushMessage)
+        await transceiver.inject(pushMessage)
+        pushData[1] = 0x56 // set RxSN
+        let lastPushMessage = try ConcreteEAPMessage.init(data: pushData)
+        await transceiver.inject(lastPushMessage)
+        await pushCounter.value
     }
 }
 
@@ -208,12 +313,5 @@ extension EAPFramingTests: AccessoryConnectionDelegate {
     }
     func sessionDidOpen(for accessory: AccessoryProtocol, session: DuplexAsyncStream?) {
         didOpenCompletion?(accessory as! AccessoryMock, session)
-    }
-}
-
-extension EAPFramingTests: TransceiverDelegate {
-    func received<MessageT: EAPMessage>(push: MessageT) {
-        print(#function)
-        pushCount += 1
     }
 }
