@@ -35,8 +35,8 @@ class ConcreteEAPMessageFactory: EAPMessageFactory {
         first.data[first.data.startIndex + 1] == second.data[second.data.startIndex+1]
     }
     func isPush(_ message: ConcreteEAPMessage) -> Bool {
-        let messageTxSequenceNumber = message.data[0]
-        let messageRxSequenceNumber = message.data[1]
+        let messageTxSequenceNumber = message.data[message.data.startIndex]
+        let messageRxSequenceNumber = message.data[message.data.startIndex+1]
         let isPush = messageTxSequenceNumber == 0 && (rxSequenceNumber == nil || rxSequenceNumber == messageRxSequenceNumber)
         if isPush {
             let nextSequenceNumber = messageRxSequenceNumber &+ 1
@@ -91,8 +91,8 @@ struct ConcreteEAPMessage: EAPMessage {
         self.header = data[data.startIndex..<data.startIndex+Self.headerLength]
         self.body = ConcreteEAPMessageBody.init(data: data.dropFirst(Self.headerLength))
     }
-    init(body: ConcreteEAPMessageBody) {
-        self.header = Data.init(count: Self.headerLength)
+    init(header: Data, body: ConcreteEAPMessageBody) {
+        self.header = header
         self.body = body
     }
 }

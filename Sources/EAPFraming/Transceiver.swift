@@ -39,7 +39,6 @@ public protocol EAPMessageBody {
 public protocol EAPMessage {
     associatedtype BodyT: EAPMessageBody
     init(data: Data) throws
-    init(body: BodyT)
     var data: Data { get }
     var body: BodyT { get }
 }
