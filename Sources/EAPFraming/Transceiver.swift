@@ -33,6 +33,7 @@ public protocol EAPMessageFactory {
 }
 
 public protocol EAPMessageBody {
+    var doesReset: Bool { get }
     var data: Data { get }
 }
 
@@ -98,8 +99,12 @@ public actor Transceiver<FactoryT: EAPMessageFactory> {
             for try await data in read {
                 await process(data: data)
             }
-            for outstandingRequest in outstandingRequests {
-                outstandingRequest.continuation.resume(throwing: AccessoryAccessError.disconnected)
+            for (index, outstandingRequest) in outstandingRequests.enumerated() {
+                if !outstandingRequest.request.body.doesReset {
+                    outstandingRequest.timer.cancel()
+                    outstandingRequest.continuation.resume(throwing: AccessoryAccessError.disconnected)
+                    outstandingRequests.remove(at: index)
+                }
             }
             finish?()
             write = nil
@@ -171,6 +176,16 @@ public actor Transceiver<FactoryT: EAPMessageFactory> {
             return .success(response.body)
         } catch(let e) {
             return .failure(e as! AccessoryAccessError)
+        }
+    }
+    public func reconnect(accessory: AccessoryProtocol) {
+        guard self.accessory.same(accessory) else { return }
+        for (index, outstandingRequest) in outstandingRequests.enumerated() {
+            if outstandingRequest.request.body.doesReset {
+                outstandingRequest.timer.cancel()
+                outstandingRequest.continuation.resume(returning: outstandingRequest.request)
+                outstandingRequests.remove(at: index)
+            }
         }
     }
 }

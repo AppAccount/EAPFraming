@@ -4,7 +4,7 @@ import AsyncExternalAccessory
 
 extension String: Error {}
 
-func makeMock() throws -> AccessoryMock {
+func makeMock(serialNumber: String="001") throws -> AccessoryMock {
     let streamBufferSize = 4096
     var optionalInputStream: InputStream?
     var optionalOutputStream: OutputStream?
@@ -12,7 +12,7 @@ func makeMock() throws -> AccessoryMock {
     guard let inputStream = optionalInputStream, let outputStream = optionalOutputStream else {
         throw "can't initialize bound streams"
     }
-    return AccessoryMock(name: "EMAN", modelNumber: "LEDOM", serialNumber: "001", manufacturer: "GFM", hardwareRevision: "1.0", protocolStrings: ["com.example.eap"], connectionID: Int.random(in: 0..<Int.max), inputStream: inputStream, outputStream: outputStream)
+    return AccessoryMock(name: "EMAN", modelNumber: "LEDOM", serialNumber: serialNumber, manufacturer: "GFM", hardwareRevision: "1.0", protocolStrings: ["com.example.eap"], connectionID: Int.random(in: 0..<Int.max), inputStream: inputStream, outputStream: outputStream)
 }
 
 public typealias SequenceNumber = UInt8
@@ -25,10 +25,10 @@ class ConcreteEAPMessageFactory: EAPMessageFactory {
     var txSequenceNumber = SequenceNumber(arc4random_uniform(1<<8)) // reduce the likelihood of false accepts on replay after app restart
     var rxSequenceNumber: SequenceNumber?
     var remainder: Data?
-    func encapsulate(body: ConcreteEAPMessageBody) throws -> ConcreteEAPMessage {
+    func encapsulate(body: ConcreteEAPMessageBody) -> ConcreteEAPMessage {
         let header = Data.init([txSequenceNumber, 0, 0, UInt8(body.data.count)])
         txSequenceNumber &+= 1 // "&+" is Swift's overflow addition operator
-        return try ConcreteEAPMessage.init(data: header + body.data)
+        return ConcreteEAPMessage.init(header: header, body: body)
     }
     func isMatched(_ first: ConcreteEAPMessage, _ second: ConcreteEAPMessage) -> Bool {
         first.data[first.data.startIndex] == second.data[second.data.startIndex] &&
@@ -98,7 +98,17 @@ struct ConcreteEAPMessage: EAPMessage {
 }
 
 struct ConcreteEAPMessageBody: EAPMessageBody, Equatable {
+    var doesReset: Bool
     var data: Data
+    
+    init(doesReset: Bool, data: Data) {
+        self.doesReset = doesReset
+        self.data = data
+    }
+    init (data: Data) {
+        self.doesReset = false
+        self.data = data
+    }
 }
 
 final class EAPFramingTests: XCTestCase {
@@ -194,6 +204,67 @@ final class EAPFramingTests: XCTestCase {
         }
     }
     
+    func testMessagePreservesDoesReset() async throws {
+        let request = ConcreteEAPMessageBody.init(doesReset: true, data: Data.init(count: 16))
+        let message = ConcreteEAPMessageFactory().encapsulate(body: request)
+        XCTAssert(message.body.doesReset == true)
+    }
+    
+    func testResetRequestTimeout() async throws {
+        let pushStream = await transceiver.listen()
+        guard let duplex = self.accessory.getStreams(), let input = duplex.input else {
+            XCTFail()
+            return
+        }
+        let request = ConcreteEAPMessageBody.init(doesReset: true, data: Data.init(count: 16))
+        async let responseTask = transceiver.send(request)
+        input.delegate?.stream?(input, handle: Stream.Event.endEncountered)
+        for await _ in pushStream { XCTFail() }
+        let count = await transceiver.outstandingRequests.count
+        XCTAssert(count == 1)
+        await transceiver.reconnect(accessory: try makeMock(serialNumber: "101")) // non-matching reconnect
+        let response = await responseTask
+        guard case .failure(let error) = response, error == .requestTimeout else {
+            XCTFail()
+            return
+        }
+    }
+    
+    func testResetRequestSyntheticResponse() async throws {
+        let pushStream = await transceiver.listen()
+        guard let duplex = self.accessory.getStreams(), let input = duplex.input else {
+            XCTFail()
+            return
+        }
+        let request = ConcreteEAPMessageBody.init(doesReset: true, data: Data.init(count: 16))
+        async let responseTask = transceiver.send(request)
+        input.delegate?.stream?(input, handle: Stream.Event.endEncountered)
+        for await _ in pushStream { XCTFail() }
+        let count = await transceiver.outstandingRequests.count
+        XCTAssert(count == 1)
+        await transceiver.reconnect(accessory: try makeMock())
+        let response = await responseTask
+        guard case .success = response else {
+            XCTFail()
+            return
+        }
+    }
+    /*
+    Task {
+        await self.manager.connectToPresentAccessories([self.accessory])
+    }
+    let duplexAsyncStream = await withCheckedContinuation { cont in
+        self.didOpenCompletion = { _, duplex in
+            cont.resume(returning: duplex)
+        }
+    }
+    guard let duplex = duplexAsyncStream else {
+        XCTFail()
+        return
+    }
+    // new transceiver!
+     */
+    
     func testRequestResponse() async throws {
         let pushStream = await transceiver.listen()
         Task {
@@ -218,8 +289,8 @@ final class EAPFramingTests: XCTestCase {
         let size = 16
         let requestData = Data.init(count: size)
         let requestBody = ConcreteEAPMessageBody.init(data: requestData)
-        let request = try factory.encapsulate(body: requestBody)
-        let requestOverride = try factory.encapsulate(body: requestBody)
+        let request = factory.encapsulate(body: requestBody)
+        let requestOverride = factory.encapsulate(body: requestBody)
         // response will be dropped due to a sequence number mismatch, resulting in a timeout
         let response = await transceiver.send(request, requestTimeoutSeconds: nil, requestOverride: requestOverride)
         guard case .failure(let error) = response, error == .requestTimeout else {
