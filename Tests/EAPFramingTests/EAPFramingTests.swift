@@ -161,7 +161,24 @@ final class EAPFramingTests: XCTestCase {
         for await _ in pushStream { XCTFail() }
     }
     
-    func testDisconnectedRequest() async throws {
+    func testPreDisconnectRequest() async throws {
+        let pushStream = await transceiver.listen()
+        guard let duplex = self.accessory.getStreams(), let input = duplex.input else {
+            XCTFail()
+            return
+        }
+        let request = ConcreteEAPMessageBody.init(data: Data.init(count: 16))
+        async let responseTask = transceiver.send(request)
+        input.delegate?.stream?(input, handle: Stream.Event.endEncountered)
+        for await _ in pushStream { XCTFail() }
+        let response = await responseTask
+        guard case .failure(let accessError) = response, accessError == .disconnected else {
+            XCTFail()
+            return
+        }
+    }
+    
+    func testPostDisconnectRequest() async throws {
         let pushStream = await transceiver.listen()
         guard let duplex = self.accessory.getStreams(), let input = duplex.input else {
             XCTFail()

@@ -98,6 +98,9 @@ public actor Transceiver<FactoryT: EAPMessageFactory> {
             for try await data in read {
                 await process(data: data)
             }
+            for outstandingRequest in outstandingRequests {
+                outstandingRequest.continuation.resume(throwing: AccessoryAccessError.disconnected)
+            }
             finish?()
             write = nil
         }
