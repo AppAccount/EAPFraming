@@ -60,10 +60,11 @@ public actor Transceiver<FactoryT: EAPMessageFactory> {
     let session: DuplexAsyncStream
     let factory: FactoryT
     var outstandingRequests = [OutstandingRequest]()
-    var write: ((Data)->())?
+    var writeYield: ((Data)->())?
     var finish: (()->())?
     var read: AsyncThrowingStream<Data, Error>?
-    var push: ((FactoryT.MessageT.BodyT)->())?
+    var pushYield: ((FactoryT.MessageT.BodyT)->())?
+    var pushFinish: (()->())?
     
     public init(accessory: AccessoryProtocol, session: DuplexAsyncStream, factory: FactoryT) {
         self.accessory = accessory
@@ -71,10 +72,11 @@ public actor Transceiver<FactoryT: EAPMessageFactory> {
         self.factory = factory
     }
     public func listen() async -> AsyncStream<FactoryT.MessageT.BodyT> {
+        pushFinish?() // signal end to a previous listener
         let read = await session.input.getReadDataStream()
         var writeFinish: (()->())?
         let writeDataStream = AsyncStream<Data> { continuation in
-            write = { data in
+            writeYield = { data in
                 continuation.yield(data)
             }
             writeFinish = {
@@ -82,18 +84,17 @@ public actor Transceiver<FactoryT: EAPMessageFactory> {
             }
         }
         await session.output.setWriteDataStream(writeDataStream)
-        var pushFinish: (()->())?
-        let push = AsyncStream<FactoryT.MessageT.BodyT> { continuation in
-            self.push = { body in
+        let pushStream = AsyncStream<FactoryT.MessageT.BodyT> { continuation in
+            self.pushYield = { body in
                 continuation.yield(body)
             }
-            pushFinish = {
+            self.pushFinish = {
                 continuation.finish()
             }
         }
         finish = {
             writeFinish?()
-            pushFinish?()
+            self.pushFinish?()
         }
         Task {
             for try await data in read {
@@ -107,9 +108,9 @@ public actor Transceiver<FactoryT: EAPMessageFactory> {
                 }
             }
             finish?()
-            write = nil
+            writeYield = nil
         }
-        return push
+        return pushStream
     }
 #if DEBUG
     public func inject(_ response: FactoryT.MessageT) async {
@@ -130,7 +131,7 @@ public actor Transceiver<FactoryT: EAPMessageFactory> {
                 outstandingRequests.remove(at: outstandingRequestIndex)
             } else {
                 if factory.isPush(message) {
-                    push?(message.body)
+                    pushYield?(message.body)
                 }
             }
         }
@@ -148,10 +149,10 @@ public actor Transceiver<FactoryT: EAPMessageFactory> {
     }
 #endif
     func send(_ request: FactoryT.MessageT, requestTimeoutSeconds: UInt, requestOverride: FactoryT.MessageT?) async -> Result<FactoryT.MessageT.BodyT, AccessoryAccessError> {
-        guard let write = write else {
+        guard let writeYield = writeYield else {
             return .failure(.disconnected)
         }
-        write(requestOverride?.data ?? request.data)
+        writeYield(requestOverride?.data ?? request.data)
         do {
             let response: FactoryT.MessageT = try await withCheckedThrowingContinuation { cont in
                 let timer = Task {

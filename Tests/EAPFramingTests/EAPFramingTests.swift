@@ -393,6 +393,16 @@ final class EAPFramingTests: XCTestCase {
         await transceiver.inject(lastPushMessage)
         await pushCounter.value
     }
+    
+    func testReplacementListener() async throws {
+        let pushStreamA = await transceiver.listen()
+        Task {
+            let _ = await transceiver.listen()
+        }
+        for await _ in pushStreamA {
+            return
+        }
+    }
 }
 
 extension EAPFramingTests: AccessoryConnectionDelegate {
