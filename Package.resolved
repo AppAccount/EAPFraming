@@ -6,8 +6,8 @@
         "repositoryURL": "https://github.com/AppAccount/AsyncExternalAccessory",
         "state": {
           "branch": null,
-          "revision": "6efa08840867b5daa97e291505efaf48db9f1d36",
-          "version": "3.0.0"
+          "revision": "0487c78db79a783d0232c7faa966cfbe9055cd8c",
+          "version": "3.0.1"
         }
       },
       {
@@ -15,8 +15,8 @@
         "repositoryURL": "https://github.com/AppAccount/AsyncStream",
         "state": {
           "branch": null,
-          "revision": "821c1bc5b949854cbe4250c3580e0bec10b2c165",
-          "version": "2.1.0"
+          "revision": "e59c2a4e7688b3f8a84c626eee2a4e76590ba440",
+          "version": "2.1.1"
         }
       }
     ]

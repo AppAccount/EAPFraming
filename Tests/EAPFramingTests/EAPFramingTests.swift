@@ -216,8 +216,15 @@ final class EAPFramingTests: XCTestCase {
             XCTFail()
             return
         }
-        let request = ConcreteEAPMessageBody.init(doesReset: true, data: Data.init(count: 16))
-        async let responseTask = transceiver.send(request)
+        let requestBody = ConcreteEAPMessageBody.init(doesReset: true, data: Data.init(count: 16))
+        let factory = ConcreteEAPMessageFactory()
+        let request = factory.encapsulate(body: requestBody)
+        let requestOverride = factory.encapsulate(body: requestBody)
+        // response will be dropped due to a sequence number mismatch, simulating a reset request
+        async let responseTask = transceiver.send(request, requestTimeoutSeconds: nil, requestOverride: requestOverride)
+        while await transceiver.outstandingRequests.count == 0 {
+            await Task.yield()
+        }
         input.delegate?.stream?(input, handle: Stream.Event.endEncountered)
         for await _ in pushStream { XCTFail() }
         let count = await transceiver.outstandingRequests.count
@@ -236,34 +243,29 @@ final class EAPFramingTests: XCTestCase {
             XCTFail()
             return
         }
-        let request = ConcreteEAPMessageBody.init(doesReset: true, data: Data.init(count: 16))
-        async let responseTask = transceiver.send(request)
+        let requestBody = ConcreteEAPMessageBody.init(doesReset: true, data: Data.init(count: 16))
+        let factory = ConcreteEAPMessageFactory()
+        let request = factory.encapsulate(body: requestBody)
+        let requestOverride = factory.encapsulate(body: requestBody)
+        // response will be dropped due to a sequence number mismatch, simulating a reset request
+        async let responseTask = transceiver.send(request, requestTimeoutSeconds: nil, requestOverride: requestOverride)
+        while await transceiver.outstandingRequests.count == 0 {
+            await Task.yield()
+        }
+        let preCount = await transceiver.outstandingRequests.count
+        XCTAssert(preCount == 1)
         input.delegate?.stream?(input, handle: Stream.Event.endEncountered)
         for await _ in pushStream { XCTFail() }
-        let count = await transceiver.outstandingRequests.count
-        XCTAssert(count == 1)
+        let postCount = await transceiver.outstandingRequests.count
+        XCTAssert(postCount == 1)
         await transceiver.reconnect(accessory: try makeMock())
         let response = await responseTask
+        print(response)
         guard case .success = response else {
             XCTFail()
             return
         }
     }
-    /*
-    Task {
-        await self.manager.connectToPresentAccessories([self.accessory])
-    }
-    let duplexAsyncStream = await withCheckedContinuation { cont in
-        self.didOpenCompletion = { _, duplex in
-            cont.resume(returning: duplex)
-        }
-    }
-    guard let duplex = duplexAsyncStream else {
-        XCTFail()
-        return
-    }
-    // new transceiver!
-     */
     
     func testRequestResponse() async throws {
         let pushStream = await transceiver.listen()
